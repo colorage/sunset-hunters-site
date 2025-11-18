@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coming Soon - Sunset Hunters Club</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            height: 100%;
+            width: 100%;
+            overflow: hidden;
+            background-color: #050505;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        #map {
+            height: 100vh;
+            width: 100vw;
+            position: absolute;
+            top: 0;
+            left: 0;
+            background-color: #050505;
+        }
+
+        .leaflet-container {
+            background: #050505;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            height: 100%;
+            width: 100%;
+        }
+
+        .leaflet-control-attribution {
+            background: rgba(5, 5, 5, 0.85);
+            color: #a0a0a0;
+        }
+
+        .coming-soon-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 1000;
+            text-align: center;
+            pointer-events: none;
+        }
+
+        .coming-soon-text {
+            font-size: 64px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(135deg, #ff8c42 0%, #ff7a35 20%, #ff6b35 40%, #ff5500 60%, #ff4500 80%, #ff4500 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin: 0;
+            text-shadow: 0 0 30px rgba(255, 107, 53, 0.3);
+        }
+
+        @media (max-width: 768px) {
+            .coming-soon-text {
+                font-size: 48px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .coming-soon-text {
+                font-size: 36px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <div class="coming-soon-overlay">
+        <h1 class="coming-soon-text">Coming Soon</h1>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Terminator calculation functions (converted from TypeScript)
+        function calculateTerminatorLatitude(longitude, date) {
+            // Calculate day of year (1-365)
+            const startOfYear = new Date(date.getFullYear(), 0, 0);
+            const dayOfYear = Math.floor((date.getTime() - startOfYear.getTime()) / (1000 * 60 * 60 * 24));
+
+            // Calculate solar declination (angle of sun relative to equator)
+            // Formula: declination = 23.45° * sin(360° * (284 + dayOfYear) / 365)
+            const declinationRad = (23.45 * Math.PI / 180) *
+                Math.sin((2 * Math.PI * (284 + dayOfYear)) / 365);
+
+            // Calculate hour angle
+            const utcHours = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600;
+            const solarNoonUTC = 12 - (longitude / 15);
+            let hourAngle = (utcHours - solarNoonUTC) * 15; // degrees
+
+            // Normalize hour angle to -180 to 180 range
+            while (hourAngle > 180) hourAngle -= 360;
+            while (hourAngle < -180) hourAngle += 360;
+
+            const hourAngleRad = hourAngle * Math.PI / 180;
+
+            // Determine if this is sunrise or sunset
+            const isSunrise = hourAngle < 0;
+
+            const cosHourAngle = Math.cos(hourAngleRad);
+
+            // Handle edge cases near poles or when cos(hourAngle) is very small
+            if (Math.abs(cosHourAngle) < 0.001) {
+                const latitude = declinationRad * 180 / Math.PI;
+                return { lat: Math.max(-90, Math.min(90, latitude)), isSunrise: isSunrise };
+            }
+
+            const tanDeclination = Math.tan(declinationRad);
+            const latRad = Math.atan(-tanDeclination / cosHourAngle);
+            const latitude = latRad * 180 / Math.PI;
+
+            // Clamp to valid range
+            return { lat: Math.max(-90, Math.min(90, latitude)), isSunrise: isSunrise };
+        }
+
+        function calculateSunsetTerminator(currentTime = new Date()) {
+            const points = [];
+            const longitudeStep = 3; // degrees - balance between accuracy and performance
+
+            // Iterate through all longitudes
+            for (let lng = -180; lng <= 180; lng += longitudeStep) {
+                const result = calculateTerminatorLatitude(lng, currentTime);
+
+                if (result !== null && !isNaN(result.lat) && isFinite(result.lat) && Math.abs(result.lat) <= 90) {
+                    points.push({ lat: result.lat, lng: lng, isSunrise: result.isSunrise });
+                }
+            }
+
+            return points;
+        }
+
+        function calculateSunsetWindowTerminator(offsetMinutes, currentTime = new Date()) {
+            // Create a new date with the offset applied
+            const offsetTime = new Date(currentTime.getTime() + offsetMinutes * 60 * 1000);
+
+            // Use the same calculation as the main terminator, but with offset time
+            const allPoints = calculateSunsetTerminator(offsetTime);
+
+            // For window lines, only include the sunset portion (exclude sunrise)
+            return allPoints.filter((point) => !point.isSunrise);
+        }
+
+        // Map state
+        let map = null;
+        let userMarker = null;
+        let terminatorPolylines = [];
+        let windowStartPolylines = [];
+        let windowEndPolylines = [];
+        let mapReady = false;
+
+        // Default location (San Francisco)
+        const DEFAULT_LOCATION = {
+            latitude: 37.78825,
+            longitude: -122.4324,
+            zoom: 12
+        };
+
+        let userLocation = null;
+
+        // Helper function to blend colors
+        function blendColor(color1, color2, ratio) {
+            const hex1 = color1.replace('#', '');
+            const hex2 = color2.replace('#', '');
+            const r1 = parseInt(hex1.substr(0, 2), 16);
+            const g1 = parseInt(hex1.substr(2, 2), 16);
+            const b1 = parseInt(hex1.substr(4, 2), 16);
+            const r2 = parseInt(hex2.substr(0, 2), 16);
+            const g2 = parseInt(hex2.substr(2, 2), 16);
+            const b2 = parseInt(hex2.substr(4, 2), 16);
+            const r = Math.round(r1 + (r2 - r1) * ratio);
+            const g = Math.round(g1 + (g2 - g1) * ratio);
+            const b = Math.round(b1 + (b2 - b1) * ratio);
+            return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+        }
+
+        // Helper function to split segments by sunrise/sunset and add gradient transitions
+        function splitBySunriseSunset(segment) {
+            if (!segment || segment.length === 0) return [];
+
+            const result = [];
+            let currentGroup = [];
+            let currentType = segment[0].isSunrise;
+            const transitionSize = 2; // Number of points on each side to blend
+
+            for (let i = 0; i < segment.length; i++) {
+                const point = segment[i];
+
+                if (point.isSunrise === currentType) {
+                    currentGroup.push(point);
+                } else {
+                    // Transition detected
+                    if (currentGroup.length > 0) {
+                        // If we have enough points, create transition zone
+                        if (currentGroup.length >= transitionSize && i + transitionSize <= segment.length) {
+                            // Split current group: keep most points, use last few for transition
+                            const mainGroup = currentGroup.slice(0, currentGroup.length - transitionSize);
+                            const transitionStart = currentGroup.slice(-transitionSize);
+                            const transitionEnd = [];
+                            for (let j = i; j < Math.min(i + transitionSize, segment.length); j++) {
+                                transitionEnd.push(segment[j]);
+                            }
+
+                            // Add main group if it has points
+                            if (mainGroup.length > 0) {
+                                result.push({ points: mainGroup, isSunrise: currentType });
+                            }
+
+                            // Create transition zone
+                            const transitionPoints = [...transitionStart, ...transitionEnd];
+                            if (transitionPoints.length > 1) {
+                                result.push({ points: transitionPoints, isSunrise: null, isTransition: true, fromType: currentType });
+                            }
+
+                            // Start new group with remaining points
+                            currentGroup = transitionEnd.slice();
+                        } else {
+                            // Not enough points for transition, just add the group
+                            result.push({ points: currentGroup, isSunrise: currentType });
+                            currentGroup = [point];
+                        }
+                    } else {
+                        currentGroup = [point];
+                    }
+                    currentType = point.isSunrise;
+                }
+            }
+
+            // Add final group
+            if (currentGroup.length > 0) {
+                result.push({ points: currentGroup, isSunrise: currentType });
+            }
+
+            return result;
+        }
+
+        // Function to split points into continuous segments
+        function splitIntoContinuousSegments(points) {
+            const segments = [];
+            let currentSegment = [];
+
+            for (let i = 0; i < points.length; i++) {
+                const point = points[i];
+
+                if (currentSegment.length === 0) {
+                    currentSegment.push(point);
+                } else {
+                    const prevPoint = currentSegment[currentSegment.length - 1];
+                    const latDiff = Math.abs(point.lat - prevPoint.lat);
+
+                    let lngDiff = Math.abs(point.lng - prevPoint.lng);
+                    if (lngDiff > 180) {
+                        lngDiff = 360 - lngDiff;
+                    }
+
+                    const crossesDateLine = (prevPoint.lng < -170 && point.lng > 170) ||
+                        (prevPoint.lng > 170 && point.lng < -170);
+
+                    if (latDiff > 45 || lngDiff > 10 || crossesDateLine) {
+                        if (currentSegment.length > 1) {
+                            segments.push(currentSegment);
+                        }
+                        currentSegment = [point];
+                    } else {
+                        currentSegment.push(point);
+                    }
+                }
+            }
+
+            if (currentSegment.length > 1) {
+                segments.push(currentSegment);
+            }
+
+            return segments;
+        }
+
+        function syncTerminatorLine(points = []) {
+            if (!map || !points || points.length === 0) {
+                return;
+            }
+
+            // Remove existing terminator lines if present
+            terminatorPolylines.forEach(polyline => {
+                if (polyline) {
+                    polyline.remove();
+                }
+            });
+            terminatorPolylines = [];
+
+            const segments = splitIntoContinuousSegments(points);
+
+            // Split each segment by sunrise/sunset and process
+            const gradientLayers = [
+                { color: '#ff8c42', opacity: 0.5, weight: 2 },
+                { color: '#ff7a35', opacity: 0.65, weight: 1.5 },
+                { color: '#ff6b35', opacity: 0.75, weight: 1 },
+                { color: '#ff5500', opacity: 0.85, weight: 0.5 },
+                { color: '#ff4500', opacity: 0.9, weight: 0.2 },
+            ];
+
+            segments.forEach((segment) => {
+                const sunriseSunsetGroups = splitBySunriseSunset(segment);
+
+                sunriseSunsetGroups.forEach((group) => {
+                    const latlngs = group.points.map(p => [p.lat, p.lng]);
+
+                    if (group.isSunrise === null && group.isTransition) {
+                        // Draw transition with blended colors
+                        const transitionLayers = 3;
+                        const fromGrey = group.fromType === true;
+                        const toColor = fromGrey ? '#ff6b35' : '#808080';
+                        const fromColor = fromGrey ? '#808080' : '#ff6b35';
+
+                        for (let layer = 0; layer < transitionLayers; layer++) {
+                            const ratio = layer / (transitionLayers - 1);
+                            const blendedColor = blendColor(fromColor, toColor, ratio);
+                            const polyline = L.polyline(latlngs, {
+                                color: blendedColor,
+                                weight: 1.5 - layer * 0.3,
+                                opacity: 0.6 - layer * 0.1,
+                                lineCap: 'round',
+                                lineJoin: 'round',
+                                smoothFactor: 1,
+                            }).addTo(map);
+                            terminatorPolylines.push(polyline);
+                        }
+                    } else if (group.isSunrise) {
+                        // Draw grey for sunrise
+                        const polyline = L.polyline(latlngs, {
+                            color: '#808080',
+                            weight: 2,
+                            opacity: 0.6,
+                            lineCap: 'round',
+                            lineJoin: 'round',
+                            smoothFactor: 1,
+                        }).addTo(map);
+                        terminatorPolylines.push(polyline);
+                    } else {
+                        // Draw colored gradient for sunset
+                        gradientLayers.forEach((style) => {
+                            const polyline = L.polyline(latlngs, {
+                                color: style.color,
+                                weight: style.weight,
+                                opacity: style.opacity,
+                                lineCap: 'round',
+                                lineJoin: 'round',
+                                smoothFactor: 1,
+                            }).addTo(map);
+                            terminatorPolylines.push(polyline);
+                        });
+                    }
+                });
+            });
+        }
+
+        function syncWindowStartLine(points = []) {
+            if (!map || !points || points.length === 0) {
+                return;
+            }
+
+            // Remove existing window start lines if present
+            windowStartPolylines.forEach(polyline => {
+                if (polyline) {
+                    polyline.remove();
+                }
+            });
+            windowStartPolylines = [];
+
+            const segments = splitIntoContinuousSegments(points);
+
+            segments.forEach((segment) => {
+                const sunriseSunsetGroups = splitBySunriseSunset(segment);
+
+                sunriseSunsetGroups.forEach((group) => {
+                    const latlngs = group.points.map(p => [p.lat, p.lng]);
+
+                    if (group.isSunrise === null && group.isTransition) {
+                        // Draw transition with blended colors (grey to yellow)
+                        const transitionLayers = 3;
+                        const fromGrey = group.fromType === true;
+                        const toColor = fromGrey ? '#ffd700' : '#808080';
+                        const fromColor = fromGrey ? '#808080' : '#ffd700';
+
+                        for (let layer = 0; layer < transitionLayers; layer++) {
+                            const ratio = layer / (transitionLayers - 1);
+                            const blendedColor = blendColor(fromColor, toColor, ratio);
+                            const polyline = L.polyline(latlngs, {
+                                color: blendedColor,
+                                weight: 2 - layer * 0.3,
+                                opacity: 0.6 - layer * 0.1,
+                                lineCap: 'round',
+                                lineJoin: 'round',
+                                smoothFactor: 1,
+                            }).addTo(map);
+                            windowStartPolylines.push(polyline);
+                        }
+                    } else if (group.isSunrise) {
+                        // Draw grey for sunrise
+                        const polyline = L.polyline(latlngs, {
+                            color: '#808080',
+                            weight: 2,
+                            opacity: 0.6,
+                            lineCap: 'round',
+                            lineJoin: 'round',
+                            smoothFactor: 1,
+                        }).addTo(map);
+                        windowStartPolylines.push(polyline);
+                    } else {
+                        // Draw yellow for sunset
+                        const polyline = L.polyline(latlngs, {
+                            color: '#ffd700', // Yellow
+                            weight: 2,
+                            opacity: 0.7,
+                            lineCap: 'round',
+                            lineJoin: 'round',
+                            smoothFactor: 1,
+                        }).addTo(map);
+                        windowStartPolylines.push(polyline);
+                    }
+                });
+            });
+        }
+
+        function syncWindowEndLine(points = []) {
+            if (!map || !points || points.length === 0) {
+                return;
+            }
+
+            // Remove existing window end lines if present
+            windowEndPolylines.forEach(polyline => {
+                if (polyline) {
+                    polyline.remove();
+                }
+            });
+            windowEndPolylines = [];
+
+            const segments = splitIntoContinuousSegments(points);
+
+            segments.forEach((segment) => {
+                const sunriseSunsetGroups = splitBySunriseSunset(segment);
+
+                sunriseSunsetGroups.forEach((group) => {
+                    const latlngs = group.points.map(p => [p.lat, p.lng]);
+
+                    if (group.isSunrise === null && group.isTransition) {
+                        // Draw transition with blended colors (grey to blue)
+                        const transitionLayers = 3;
+                        const fromGrey = group.fromType === true;
+                        const toColor = fromGrey ? '#4169e1' : '#808080';
+                        const fromColor = fromGrey ? '#808080' : '#4169e1';
+
+                        for (let layer = 0; layer < transitionLayers; layer++) {
+                            const ratio = layer / (transitionLayers - 1);
+                            const blendedColor = blendColor(fromColor, toColor, ratio);
+                            const polyline = L.polyline(latlngs, {
+                                color: blendedColor,
+                                weight: 2 - layer * 0.3,
+                                opacity: 0.6 - layer * 0.1,
+                                lineCap: 'round',
+                                lineJoin: 'round',
+                                smoothFactor: 1,
+                            }).addTo(map);
+                            windowEndPolylines.push(polyline);
+                        }
+                    } else if (group.isSunrise) {
+                        // Draw grey for sunrise
+                        const polyline = L.polyline(latlngs, {
+                            color: '#808080',
+                            weight: 2,
+                            opacity: 0.6,
+                            lineCap: 'round',
+                            lineJoin: 'round',
+                            smoothFactor: 1,
+                        }).addTo(map);
+                        windowEndPolylines.push(polyline);
+                    } else {
+                        // Draw blue for sunset
+                        const polyline = L.polyline(latlngs, {
+                            color: '#4169e1', // Blue
+                            weight: 2,
+                            opacity: 0.7,
+                            lineCap: 'round',
+                            lineJoin: 'round',
+                            smoothFactor: 1,
+                        }).addTo(map);
+                        windowEndPolylines.push(polyline);
+                    }
+                });
+            });
+        }
+
+        function updateUserLocation(coords) {
+            if (!map) return;
+
+            if (!coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
+                if (userMarker) {
+                    userMarker.remove();
+                    userMarker = null;
+                }
+                return;
+            }
+
+            if (!userMarker) {
+                userMarker = L.circleMarker([coords.latitude, coords.longitude], {
+                    radius: 8,
+                    color: '#4caf50',
+                    weight: 2,
+                    fillColor: '#4caf50',
+                    fillOpacity: 0.6,
+                }).addTo(map);
+            } else {
+                userMarker.setLatLng([coords.latitude, coords.longitude]);
+            }
+
+            // Store user location but keep map at world view
+            if (!userLocation) {
+                userLocation = coords;
+            }
+        }
+
+        function updateTerminatorLines() {
+            if (!mapReady) return;
+
+            try {
+                const currentTime = new Date();
+                const mainPoints = calculateSunsetTerminator(currentTime);
+                // Window start: 45 min before sunset
+                const startPoints = calculateSunsetWindowTerminator(45, currentTime);
+                // Window end: 15 min after sunset
+                const endPoints = calculateSunsetWindowTerminator(-15, currentTime);
+
+                syncTerminatorLine(mainPoints);
+                syncWindowStartLine(startPoints);
+                syncWindowEndLine(endPoints);
+            } catch (error) {
+                console.error('[Map] Error calculating terminators:', error);
+            }
+        }
+
+        function initializeMap() {
+            if (typeof L === 'undefined') {
+                console.error('[Leaflet] L is not defined, Leaflet library not loaded');
+                return;
+            }
+
+            try {
+                // Define world bounds (approximate limits of map tiles)
+                const worldBounds = [[-85, -180], [85, 180]];
+
+                map = L.map('map', {
+                    zoomControl: false,
+                    zoomSnap: 0.25,
+                    zoomDelta: 0.5,
+                    preferCanvas: true,
+                    maxBounds: worldBounds,
+                    maxBoundsViscosity: 1.0,
+                    worldCopyJump: false,
+                    minZoom: 2,
+                    dragging: false,
+                    touchZoom: false,
+                    doubleClickZoom: false,
+                    scrollWheelZoom: false,
+                    boxZoom: false,
+                    keyboard: false,
+                });
+
+                L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+                    subdomains: 'abcd',
+                    maxZoom: 19,
+                    noWrap: true,
+                }).addTo(map);
+
+                // Invalidate size to ensure proper rendering
+                setTimeout(() => {
+                    map.invalidateSize();
+                    // Set zoom level to show world map (zoom 2 shows continents clearly)
+                    map.setView([0, 0], 2);
+                    mapReady = true;
+                    updateTerminatorLines();
+                }, 100);
+
+                console.log('[Leaflet] Map initialized successfully');
+            } catch (error) {
+                console.error('[Leaflet] Failed to initialize map:', error);
+            }
+        }
+
+        function getCurrentLocation() {
+            // Use IP-based geolocation (no permission required)
+            fetch('https://ip-api.com/json/')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success' && data.lat && data.lon) {
+                        const coords = {
+                            latitude: data.lat,
+                            longitude: data.lon,
+                        };
+                        updateUserLocation(coords);
+                        console.log('[Location] User location obtained from IP:', coords);
+                    } else {
+                        throw new Error('Failed to get location from IP');
+                    }
+                })
+                .catch(error => {
+                    console.warn('[Location] Error getting location from IP:', error.message);
+                    // Use default location (San Francisco)
+                    updateUserLocation({
+                        latitude: DEFAULT_LOCATION.latitude,
+                        longitude: DEFAULT_LOCATION.longitude,
+                    });
+                });
+        }
+
+        // Wait for Leaflet to load (with timeout)
+        let waitAttempts = 0;
+        const maxWaitAttempts = 100; // 5 seconds max
+        function waitForLeaflet() {
+            if (typeof L !== 'undefined') {
+                initializeMap();
+                getCurrentLocation();
+            } else if (waitAttempts < maxWaitAttempts) {
+                waitAttempts++;
+                setTimeout(waitForLeaflet, 50);
+            } else {
+                console.error('[Leaflet] Timeout waiting for Leaflet library to load');
+            }
+        }
+
+        // Initialize map when DOM is ready and Leaflet is loaded
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', waitForLeaflet);
+        } else {
+            waitForLeaflet();
+        }
+
+        // Update terminator lines every second
+        setInterval(() => {
+            updateTerminatorLines();
+        }, 1000);
+    </script>
+</body>
+
+</html>
